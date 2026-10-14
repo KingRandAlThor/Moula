@@ -37,7 +37,7 @@ def load_cfg():
         "KELLY_FRACTION": "0.25", "RESERVE_REQUESTS": "6", "HORIZON_HOURS": "48",
         "SMTP_HOST": "smtp.gmail.com", "SMTP_USER": "", "SMTP_PASSWORD": "", "MAIL_TO": "",
         "FREE_USER": "", "FREE_PASS": "", "NTFY_TOPIC": "",
-        "TELEGRAM_TOKEN": "", "TELEGRAM_CHAT": "",
+        "TELEGRAM_TOKEN": "", "TELEGRAM_CHAT": "", "AF_KEY": "",
     }
     f = BASE / "config.env"
     if f.exists():
@@ -65,6 +65,9 @@ def db():
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
     CREATE TABLE IF NOT EXISTS bets(id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, outcome TEXT, label TEXT,
         match TEXT, odd REAL, stake REAL, commence REAL, status TEXT, ts REAL);
+    CREATE TABLE IF NOT EXISTS af_fix(fixture_id INTEGER PRIMARY KEY, ts REAL, home TEXT, away TEXT,
+        referee TEXT, home_abs REAL, away_abs REAL);
+    CREATE TABLE IF NOT EXISTS ev_af(event_id TEXT PRIMARY KEY, home_abs REAL, away_abs REAL, referee TEXT);
     CREATE TABLE IF NOT EXISTS ctx(event_id TEXT PRIMARY KEY, temp REAL, wind REAL, rain REAL, humid REAL);
     CREATE INDEX IF NOT EXISTS ix_obs ON obs(event_id, outcome, ts);
     """)
@@ -207,10 +210,85 @@ def get_ctx(con, event_id):
     return (list(r), 1.0) if r and None not in r else (list(WX_DEFAULT), 0.0)
 
 
-def features(cons_p, pin_p, odd, drift, n, outcome, home, away, wx, has_wx, sport, sports):
+# ---------- joueurs (blessés/suspendus) et arbitre : API-Football ----------
+AF_URL = "https://v3.football.api-sports.io"
+AF_DEFAULT = (0.0, 0.0, 0.45, 0.25, 0.0, 0.0)
+
+
+def af_get(path, **params):
+    r = requests.get(AF_URL + "/" + path, params=params, headers={"x-apisports-key": CFG["AF_KEY"]}, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("errors"):
+        raise RuntimeError(j["errors"])
+    return j["response"]
+
+
+def refresh_af(con):
+    """Matchs d'aujourd'hui et demain (limite du plan gratuit) : arbitre + absents par équipe (4 requêtes / 6 h)."""
+    if not CFG["AF_KEY"] or time.time() - float(meta_get(con, "af_ts", 0)) < 6 * 3600:
+        return
+    meta_set(con, "af_ts", time.time())
+    try:
+        for k in range(2):
+            day = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=k)).strftime("%Y-%m-%d")
+            fixtures = af_get("fixtures", date=day)
+            absent = {}
+            for i in af_get("injuries", date=day):
+                w = 1.0 if i["player"].get("type") == "Missing Fixture" else 0.5
+                key = (i["fixture"]["id"], i["team"]["id"])
+                absent[key] = absent.get(key, 0.0) + w
+            for f in fixtures:
+                fx, t = f["fixture"], f["teams"]
+                con.execute("INSERT OR REPLACE INTO af_fix VALUES(?,?,?,?,?,?,?)", (
+                    fx["id"], fx["timestamp"], t["home"]["name"], t["away"]["name"], fx.get("referee"),
+                    absent.get((fx["id"], t["home"]["id"]), 0.0), absent.get((fx["id"], t["away"]["id"]), 0.0)))
+        con.commit()
+    except Exception as e:
+        print("api-football:", e)
+
+
+def _sim(a, b):
+    import difflib
+    a, b = _norm(a), _norm(b)
+    return difflib.SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+def link_af(con, event_id, home, away, commence):
+    """Associe l'événement The Odds API au match API-Football (même heure ±3 h, noms proches)."""
+    if not CFG["AF_KEY"]:
+        return
+    best, score = None, 0.0
+    for r in con.execute("SELECT home, away, referee, home_abs, away_abs FROM af_fix WHERE ts BETWEEN ? AND ?",
+                         (commence - 3 * 3600, commence + 3 * 3600)):
+        s = min(_sim(home, r[0]), _sim(away, r[1]))
+        if s > score:
+            best, score = r, s
+    if best and score >= 0.6:
+        con.execute("INSERT OR REPLACE INTO ev_af VALUES(?,?,?,?)", (event_id, best[3], best[4], best[2]))
+
+
+def get_af(con, event_id):
+    r = con.execute("SELECT home_abs, away_abs, referee FROM ev_af WHERE event_id=?", (event_id,)).fetchone()
+    if not r:
+        return AF_DEFAULT
+    ref_stats = AF_DEFAULT[2:5]
+    if r[2]:
+        # Profil de l'arbitre sur nos matchs terminés (hors ce match), lissé vers la moyenne
+        n, hw, dr = con.execute("""
+            SELECT COUNT(*), COALESCE(SUM(res.winner = m.home), 0), COALESCE(SUM(res.winner = 'Draw'), 0)
+            FROM ev_af a JOIN results res ON res.event_id = a.event_id
+            JOIN (SELECT DISTINCT event_id, home FROM obs) m ON m.event_id = a.event_id
+            WHERE a.referee = ? AND a.event_id != ?""", (r[2], event_id)).fetchone()
+        k = 10.0
+        ref_stats = ((hw + 0.45 * k) / (n + k), (dr + 0.25 * k) / (n + k), float(n))
+    return (r[0], r[1], *ref_stats, 1.0)
+
+
+def features(cons_p, pin_p, odd, drift, n, outcome, home, away, wx, has_wx, sport, sports, af=AF_DEFAULT):
     side = [float(outcome == home), float(outcome == away), float(outcome == "Draw")]
     return ([logit(cons_p), logit(pin_p), math.log(odd), drift, n] + side + list(wx) + [has_wx]
-            + [float(sport == s) for s in sports])
+            + [float(sport == s) for s in sports] + list(af))
 
 
 _model = None
@@ -281,7 +359,8 @@ def train(con):
     X = []
     for r in rows:
         wx, has_wx = get_ctx(con, r[0])
-        X.append(features(r[3], r[4], r[2], math.log(r[2] / r[8]), r[5], r[1], r[9], r[10], wx, has_wx, r[11], sports))
+        X.append(features(r[3], r[4], r[2], math.log(r[2] / r[8]), r[5], r[1], r[9], r[10], wx, has_wx, r[11],
+                          sports, get_af(con, r[0])))
     X = np.array(X)
     y = np.array([1 if r[1] == r[7] else 0 for r in rows])
     cut = int(len(rows) * 0.75)
@@ -453,6 +532,7 @@ def cycle(con):
         print("💀 Bankroll à 0 : plus d'alertes.")
         return
     horizon = now + float(CFG["HORIZON_HOURS"]) * 3600
+    refresh_af(con)
     min_edge, max_edge = float(CFG["MIN_EDGE"]), float(CFG["MAX_EDGE"])
     for sport in sports_list():
         if REMAINING is not None and REMAINING < int(CFG["RESERVE_REQUESTS"]):
@@ -469,6 +549,8 @@ def cycle(con):
                 continue
             update_weather(con, ev["id"], ev["home_team"], commence)
             wx, has_wx = get_ctx(con, ev["id"])
+            link_af(con, ev["id"], ev["home_team"], ev["away_team"], commence)
+            af = get_af(con, ev["id"])
             for a in analyse(ev):
                 first = con.execute("SELECT odd FROM obs WHERE event_id=? AND outcome=? ORDER BY ts LIMIT 1",
                                     (ev["id"], a["outcome"])).fetchone()
@@ -478,7 +560,7 @@ def cycle(con):
                              a["outcome"], a["odd"], a["cons_p"], a["pin_p"], a["n"]))
                 p = a["cons_p"]
                 mp = model_prob(p, a["pin_p"], a["odd"], drift, a["n"], a["outcome"], ev["home_team"],
-                                ev["away_team"], wx, has_wx, sport)
+                                ev["away_team"], wx, has_wx, sport, af=af)
                 if mp is not None:
                     if mp * a["odd"] - 1 < 0:
                         continue

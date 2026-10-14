@@ -56,4 +56,5 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+          AF_KEY: ${{ secrets.AF_KEY }}
         run: python monitor.py once
