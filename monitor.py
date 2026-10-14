@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import smtplib
 import sqlite3
 import sys
@@ -27,6 +28,7 @@ MAX_STAKE_PCT = 0.06
 MIN_STAKE = 0.10
 DRY = "--dry" in sys.argv
 REMAINING = None
+_con_for_meta = None
 SPENT = 0
 TZ = ZoneInfo("Europe/Paris")
 
@@ -62,7 +64,8 @@ CFG = load_cfg()
 
 # ---------- base de données ----------
 def db():
-    con = sqlite3.connect(DB)
+    global _con_for_meta
+    con = _con_for_meta = sqlite3.connect(DB)
     con.executescript("""
     CREATE TABLE IF NOT EXISTS obs(ts REAL, event_id TEXT, sport TEXT, commence REAL, home TEXT, away TEXT,
         outcome TEXT, odd REAL, cons_p REAL, pin_p REAL, n INTEGER);
@@ -104,6 +107,8 @@ def api(path, **params):
     rem = r.headers.get("x-requests-remaining")
     if rem is not None:
         REMAINING = int(float(rem))
+        if _con_for_meta is not None:
+            meta_set(_con_for_meta, "remaining", REMAINING)
     SPENT += int(float(r.headers.get("x-requests-last") or 0))
     return r.json()
 
@@ -493,6 +498,66 @@ def die(con, reason):
     tg_send(reason + "\nFin de la partie. Envoie « solde 10 » pour recommencer.")
 
 
+def stats_line(con):
+    r = con.execute("SELECT COUNT(*), COALESCE(SUM(status='won'),0), COALESCE(SUM(status='lost'),0), "
+                    "COALESCE(SUM(CASE WHEN status='placed' THEN stake END),0) FROM bets "
+                    "WHERE status IN ('placed','won','lost')").fetchone()
+    return f"{r[0]} paris ({r[1]} gagnés, {r[2]} perdus, {r[3]:.2f} € en jeu)"
+
+
+def chat_reply(con, text):
+    """Comprend une demande en français simple et répond (pari obligatoire géré par mission_step)."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", text.lower()).encode("ascii", "ignore").decode()
+    now = time.time()
+    bank, dead = bankroll(con)
+    if re.search(r"\b(solde|bankroll|argent|combien|cagnotte)\b", t):
+        return (f"💀 Solde : 0 € (mort). Envoie « solde 10 » pour relancer." if dead else
+                f"💰 Solde : {bank:.2f} € | mise max par pari : {bank * MAX_STAKE_PCT:.2f} €\n{stats_line(con)}")
+    if re.search(r"\b(mission|aujourd|12h|14h|vivant|mort)\b", t):
+        day = dt.datetime.fromtimestamp(now, TZ).date()
+        s, e = win_bounds(day)
+        if dead:
+            return "💀 Je suis mort. Envoie « solde 10 » pour me relancer."
+        if mission_done(con, day):
+            return "✅ Mission du jour accomplie : un pari a été placé entre 12h et 14h."
+        if now < s:
+            return f"🕛 Mission : il faudra placer un pari entre {CFG['MISSION_FROM']}h et {CFG['MISSION_TO']}h (dans {int((s - now) / 60)} min)."
+        if now < e + float(CFG["MISSION_GRACE_MIN"]) * 60:
+            return f"🚨 Mission en cours : encore {int((e - now) / 60)} min pour placer un pari !"
+        return "Mission d'aujourd'hui terminée. Prochaine fenêtre demain 12h-14h."
+    if re.search(r"\b(mes paris|paris|historique|resultats?)\b", t) and not re.search(r"parier|miser|jouer", t):
+        rows = con.execute("SELECT match, label, odd, stake, status FROM bets WHERE status IN ('placed','won','lost') "
+                           "ORDER BY id DESC LIMIT 10").fetchall()
+        icon = {"won": "🏆", "lost": "😞", "placed": "⏳"}
+        return "\n".join(f"{icon[r[4]]} {r[0]} | {r[1]} @ {r[2]} | {r[3]} €" for r in rows) or "Aucun pari pour l'instant."
+    if re.search(r"\b(statut|status|quota|requetes|modele|reseau|neurone|etat)\b", t):
+        n = con.execute("SELECT COUNT(*) FROM results").fetchone()[0]
+        rem = meta_get(con, "remaining", "?")
+        return (f"📊 Requêtes The Odds API restantes : {rem}\nMatchs terminés appris : {n}/200 (≈600 échantillons)\n"
+                f"Réseau neuronal : {'actif' if MODEL.exists() else 'en apprentissage'}\n{stats_line(con)}")
+    if re.search(r"\b(radar|meilleurs?|conseil|recommande|parier|miser|jouer|pari|match|value|sur quoi|quoi)\b", t):
+        pool = candidates(con, now, now + float(CFG["HORIZON_HOURS"]) * 3600)
+        if dead:
+            return "💀 Je suis mort : plus de paris."
+        if not pool:
+            return "Aucun match exploitable dans les prochaines 48 h (cotes pas encore récupérées)."
+        top = pool[0]
+        if top["edge"] >= float(CFG["MIN_EDGE"]) and con.execute(
+                "SELECT 1 FROM alerts WHERE event_id=? AND outcome=?", (top["event_id"], top["outcome"])).fetchone():
+            return (f"Mon meilleur pari reste celui déjà proposé : {top['home']} - {top['away']}, "
+                    f"{top['outcome'] if top['outcome'] != 'Draw' else 'Nul'} @ {top['odd']}. Dis « placé » si tu l'as joué.")
+        if top["edge"] >= float(CFG["MIN_EDGE"]) and not con.execute(
+                "SELECT 1 FROM alerts WHERE event_id=? AND outcome=?", (top["event_id"], top["outcome"])).fetchone():
+            propose_bet(con, now, top)
+            return "👆 Voilà mon meilleur pari du moment."
+        lines = [f"• {c['home']} - {c['away']} ({dt.datetime.fromtimestamp(c['commence'], TZ):%d/%m %H:%M}) : "
+                 f"{c['outcome'] if c['outcome'] != 'Draw' else 'Nul'} @ {c['odd']} (edge {c['edge']:+.1%})" for c in pool[:3]]
+        return ("Pas de vrai value bet pour l'instant (seuil " + f"{float(CFG['MIN_EDGE']):.0%}). Les moins mauvais :\n"
+                + "\n".join(lines) + "\n\nJe t'alerte dès qu'un avantage apparaît.")
+    return "Je n'ai pas compris. Écris « aide » pour voir ce que je sais faire."
+
+
 def poll_telegram(con, wait=0):
     """Lit tes réponses : boutons « placé / ignoré » et commandes texte. wait = attente longue (secondes)."""
     if not (CFG["TELEGRAM_TOKEN"] and CFG["TELEGRAM_CHAT"]) or DRY:
@@ -532,7 +597,10 @@ def poll_telegram(con, wait=0):
             tg_send(reply)
             continue
         text = (msg or {}).get("text", "").strip().lower()
-        if text.startswith("solde"):
+        if re.match(r"^(j'ai |jai )?(plac[eé]|pari[eé]|fait|c'est fait|done)\b", text):
+            text = "ok " + " ".join(text.split()[1:] if text.split()[0] in ("placé", "place", "fait", "done") else
+                                    text.split()[2:] if text.startswith(("j'ai", "jai")) else [])
+        if text.startswith("solde") and len(text.split()) > 1:
             try:
                 set_bankroll(con, float(text.split()[1].replace(",", ".")))
             except (IndexError, ValueError):
@@ -557,12 +625,12 @@ def poll_telegram(con, wait=0):
                         (odd, round(stake, 2), msg.get("date", time.time()), b[0]))
             set_bankroll(con, bankroll(con)[0] - round(stake, 2))
             tg_send(f"✅ Enregistré : {b[1]} @ {odd} — {round(stake, 2)} € (plafonné à 6 %). Solde : {bankroll(con)[0]:.2f} €")
-        elif text in ("/start", "aide", "help"):
-            tg_send("Boutons sous chaque alerte, ou : « ok 0.5 @2.1 » (mise/cote réelles), « solde 12.5 », « paris ».")
-        elif text == "paris":
-            rows = con.execute("SELECT match, label, odd, stake, status FROM bets WHERE status IN ('placed','won','lost') "
-                               "ORDER BY id DESC LIMIT 10").fetchall()
-            tg_send("\n".join(f"{r[0]} | {r[1]} @ {r[2]} | {r[3]} € | {r[4]}" for r in rows) or "Aucun pari.")
+        elif text in ("/start", "aide", "help", "/help"):
+            tg_send("Parle-moi simplement :\n• « solde » – ton solde et tes stats\n• « sur quoi parier ? » – le meilleur pari\n"
+                    "• « radar » – les 3 meilleurs matchs\n• « mes paris » – historique\n• « mission » – où j'en suis aujourd'hui\n"
+                    "• « statut » – quota et modèle\n• « placé » ou « ok 0.5 @2.1 » – confirmer un pari\n• « solde 12.5 » – corriger le solde")
+        elif text:
+            tg_send(chat_reply(con, text))
     con.commit()
 
 
