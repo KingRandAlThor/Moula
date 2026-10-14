@@ -65,6 +65,7 @@ def db():
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
     CREATE TABLE IF NOT EXISTS bets(id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, outcome TEXT, label TEXT,
         match TEXT, odd REAL, stake REAL, commence REAL, status TEXT, ts REAL);
+    CREATE TABLE IF NOT EXISTS ctx(event_id TEXT PRIMARY KEY, temp REAL, wind REAL, rain REAL, humid REAL);
     CREATE INDEX IF NOT EXISTS ix_obs ON obs(event_id, outcome, ts);
     """)
     return con
@@ -135,21 +136,98 @@ def logit(p):
     return math.log(p / (1 - p))
 
 
-def features(cons_p, pin_p, odd, drift, n):
-    return [logit(cons_p), logit(pin_p), math.log(odd), drift, n]
+WX_DEFAULT = (12.0, 10.0, 0.0, 70.0)
+
+# Coordonnées approximatives des stades (Ligue 1 / Ligue 2 / grands clubs) pour la météo
+STADIUMS = {
+    "paris saint germain": (48.841, 2.253), "marseille": (43.270, 5.396), "lyon": (45.765, 4.982),
+    "monaco": (43.728, 7.416), "lille": (50.612, 3.130), "nice": (43.705, 7.193),
+    "lens": (50.433, 2.815), "rennes": (48.107, -1.713), "strasbourg": (48.560, 7.755),
+    "nantes": (47.256, -1.525), "toulouse": (43.583, 1.434), "montpellier": (43.622, 3.812),
+    "reims": (49.246, 4.025), "brest": (48.403, -4.462), "le havre": (49.499, 0.169),
+    "auxerre": (47.787, 3.589), "angers": (47.461, -0.531), "saint-etienne": (45.461, 4.390),
+    "metz": (49.109, 6.159), "lorient": (47.749, -3.368), "paris fc": (48.844, 2.253),
+    "le mans": (47.998, 0.232), "clermont": (45.816, 3.121), "bordeaux": (44.829, -0.562),
+    "caen": (49.179, -0.396), "guingamp": (48.566, -3.164), "grenoble": (45.183, 5.740),
+    "amiens": (49.879, 2.263), "pau": (43.290, -0.364), "rodez": (44.356, 2.572),
+    "dunkerque": (51.036, 2.378), "troyes": (48.311, 4.083), "red star": (48.917, 2.341),
+    "laval": (48.063, -0.766), "annecy": (45.918, 6.136), "martigues": (43.405, 5.048),
+    "bastia": (42.693, 9.440), "ajaccio": (41.931, 8.759), "nancy": (48.694, 6.211),
+    "dijon": (47.311, 5.063),
+}
+
+
+def _norm(s):
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s.lower()).encode("ascii", "ignore").decode()
+    return s.replace("fc", "").replace("olympique", "").replace("stade", "").strip(" .-")
+
+
+def locate(con, team):
+    key = _norm(team)
+    for name, xy in STADIUMS.items():
+        if name in key or key in name:
+            return xy
+    cached = meta_get(con, "geo:" + key)
+    if cached:
+        return tuple(map(float, cached.split(","))) if cached != "none" else None
+    xy = None
+    try:
+        r = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                         params={"name": key, "count": 1}, timeout=15).json().get("results")
+        if r:
+            xy = (r[0]["latitude"], r[0]["longitude"])
+    except Exception:
+        pass
+    meta_set(con, "geo:" + key, f"{xy[0]},{xy[1]}" if xy else "none")
+    return xy
+
+
+def update_weather(con, event_id, home, commence):
+    """Prévision au coup d'envoi (Open-Meteo, gratuit). Rafraîchie à chaque cycle jusqu'au match."""
+    if not (time.time() < commence < time.time() + 7 * 86400):
+        return
+    xy = locate(con, home)
+    if not xy:
+        return
+    try:
+        h = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": xy[0], "longitude": xy[1], "timezone": "UTC", "forecast_days": 8,
+            "hourly": "temperature_2m,precipitation,wind_speed_10m,relative_humidity_2m"}, timeout=20).json()["hourly"]
+        i = h["time"].index(dt.datetime.fromtimestamp(commence, dt.timezone.utc).strftime("%Y-%m-%dT%H:00"))
+        con.execute("INSERT OR REPLACE INTO ctx VALUES(?,?,?,?,?)", (
+            event_id, h["temperature_2m"][i], h["wind_speed_10m"][i], h["precipitation"][i],
+            h["relative_humidity_2m"][i]))
+    except Exception as e:
+        print("météo:", e)
+
+
+def get_ctx(con, event_id):
+    r = con.execute("SELECT temp, wind, rain, humid FROM ctx WHERE event_id=?", (event_id,)).fetchone()
+    return (list(r), 1.0) if r and None not in r else (list(WX_DEFAULT), 0.0)
+
+
+def features(cons_p, pin_p, odd, drift, n, outcome, home, away, wx, has_wx, sport, sports):
+    side = [float(outcome == home), float(outcome == away), float(outcome == "Draw")]
+    return ([logit(cons_p), logit(pin_p), math.log(odd), drift, n] + side + list(wx) + [has_wx]
+            + [float(sport == s) for s in sports])
 
 
 _model = None
 
 
-def model_prob(f):
+def model_prob(*args, **kw):
     global _model
     if _model is None and MODEL.exists():
         import pickle
         _model = pickle.loads(MODEL.read_bytes())
+        if not isinstance(_model, dict):
+            _model = None
+            return None
     if _model is None:
         return None
-    return float(_model.predict_proba([f])[0][1])
+    f = features(*args, sports=_model["sports"], **kw)
+    return float(_model["net"].predict_proba([f])[0][1])
 
 
 # ---------- apprentissage ----------
@@ -189,7 +267,8 @@ def train(con):
         return
     rows = con.execute("""
         SELECT o.event_id, o.outcome, o.odd, o.cons_p, o.pin_p, o.n, o.commence, r.winner,
-               (SELECT odd FROM obs f WHERE f.event_id=o.event_id AND f.outcome=o.outcome ORDER BY ts LIMIT 1)
+               (SELECT odd FROM obs f WHERE f.event_id=o.event_id AND f.outcome=o.outcome ORDER BY ts LIMIT 1),
+               o.home, o.away, o.sport
         FROM obs o JOIN results r ON r.event_id=o.event_id
         WHERE o.ts = (SELECT MAX(ts) FROM obs x WHERE x.event_id=o.event_id AND x.outcome=o.outcome AND x.ts < o.commence)
         ORDER BY o.commence""").fetchall()
@@ -198,7 +277,12 @@ def train(con):
     if len(rows) < 600:
         print(f"Apprentissage : {len(rows)} échantillons, 600 requis.")
         return
-    X = np.array([features(r[3], r[4], r[2], math.log(r[2] / r[8]), r[5]) for r in rows])
+    sports = sorted({r[11] for r in rows})
+    X = []
+    for r in rows:
+        wx, has_wx = get_ctx(con, r[0])
+        X.append(features(r[3], r[4], r[2], math.log(r[2] / r[8]), r[5], r[1], r[9], r[10], wx, has_wx, r[11], sports))
+    X = np.array(X)
     y = np.array([1 if r[1] == r[7] else 0 for r in rows])
     cut = int(len(rows) * 0.75)
     net = make_pipeline(StandardScaler(), MLPClassifier((32, 16), alpha=1e-2, early_stopping=True,
@@ -210,7 +294,7 @@ def train(con):
     if ll_net < ll_mkt:
         import pickle
         net.fit(X, y)
-        MODEL.write_bytes(pickle.dumps(net))
+        MODEL.write_bytes(pickle.dumps({"net": net, "sports": sports}))
         global _model
         _model = None
         print("Modèle activé.")
@@ -383,6 +467,8 @@ def cycle(con):
             commence = dt.datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00")).timestamp()
             if not (now < commence < horizon):
                 continue
+            update_weather(con, ev["id"], ev["home_team"], commence)
+            wx, has_wx = get_ctx(con, ev["id"])
             for a in analyse(ev):
                 first = con.execute("SELECT odd FROM obs WHERE event_id=? AND outcome=? ORDER BY ts LIMIT 1",
                                     (ev["id"], a["outcome"])).fetchone()
@@ -391,7 +477,8 @@ def cycle(con):
                             (now, ev["id"], sport, commence, ev["home_team"], ev["away_team"],
                              a["outcome"], a["odd"], a["cons_p"], a["pin_p"], a["n"]))
                 p = a["cons_p"]
-                mp = model_prob(features(p, a["pin_p"], a["odd"], drift, a["n"]))
+                mp = model_prob(p, a["pin_p"], a["odd"], drift, a["n"], a["outcome"], ev["home_team"],
+                                ev["away_team"], wx, has_wx, sport)
                 if mp is not None:
                     if mp * a["odd"] - 1 < 0:
                         continue
