@@ -203,6 +203,9 @@ def update_weather(con, event_id, home, commence):
     """Prévision au coup d'envoi (Open-Meteo, gratuit). Rafraîchie à chaque cycle jusqu'au match."""
     if not (time.time() < commence < time.time() + 7 * 86400):
         return
+    if time.time() - float(meta_get(con, "wx:" + event_id, 0)) < 3 * 3600:
+        return
+    meta_set(con, "wx:" + event_id, time.time())
     xy = locate(con, home)
     if not xy:
         return
