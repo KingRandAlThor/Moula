@@ -27,17 +27,23 @@ MAX_STAKE_PCT = 0.06
 MIN_STAKE = 0.10
 DRY = "--dry" in sys.argv
 REMAINING = None
-
+SPENT = 0
+TZ = ZoneInfo("Europe/Paris")
 
 def load_cfg():
     cfg = {
         "ODDS_API_KEY": "", "TARGET_BOOK": "Unibet (FR)",
-        "SPORTS": "soccer_france_ligue_one",         "INTERVAL_MIN": "96",
-                "ACTIVE_FROM": "0", "ACTIVE_TO": "24", "MIN_EDGE": "0.04", "MAX_EDGE": "0.25",
+        "SPORTS": "soccer_france_ligue_one,soccer_epl,soccer_spain_la_liga,soccer_germany_bundesliga,"
+                  "soccer_italy_serie_a,soccer_france_ligue_two,soccer_uefa_champs_league,"
+                  "soccer_uefa_europa_league,soccer_portugal_primeira_liga,soccer_netherlands_eredivisie",
+        "INTERVAL_MIN": "96",
+        "ACTIVE_FROM": "0", "ACTIVE_TO": "24", "MIN_EDGE": "0.04", "MAX_EDGE": "0.25",
         "KELLY_FRACTION": "0.25", "RESERVE_REQUESTS": "6", "HORIZON_HOURS": "48",
         "SMTP_HOST": "smtp.gmail.com", "SMTP_USER": "", "SMTP_PASSWORD": "", "MAIL_TO": "",
         "FREE_USER": "", "FREE_PASS": "", "NTFY_TOPIC": "",
         "TELEGRAM_TOKEN": "", "TELEGRAM_CHAT": "", "AF_KEY": "",
+        "MISSION_FROM": "12", "MISSION_TO": "14", "MISSION_GRACE_MIN": "10", "LISTEN_SECONDS": "300",
+        "FORCED_STAKE_PCT": "0.02",
     }
     f = BASE / "config.env"
     if f.exists():
@@ -71,6 +77,12 @@ def db():
     CREATE TABLE IF NOT EXISTS ctx(event_id TEXT PRIMARY KEY, temp REAL, wind REAL, rain REAL, humid REAL);
     CREATE INDEX IF NOT EXISTS ix_obs ON obs(event_id, outcome, ts);
     """)
+    for table, col, typ in (("bets", "placed_ts", "REAL"), ("af_fix", "hg", "INTEGER"),
+                            ("af_fix", "ag", "INTEGER"), ("af_fix", "status", "TEXT")):
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     return con
 
 
@@ -85,13 +97,14 @@ def meta_set(con, k, v):
 
 # ---------- API ----------
 def api(path, **params):
-    global REMAINING
+    global REMAINING, SPENT
     params["apiKey"] = CFG["ODDS_API_KEY"]
     r = requests.get(API + path, params=params, timeout=30)
     r.raise_for_status()
     rem = r.headers.get("x-requests-remaining")
     if rem is not None:
         REMAINING = int(float(rem))
+    SPENT += int(float(r.headers.get("x-requests-last") or 0))
     return r.json()
 
 
@@ -225,29 +238,37 @@ def af_get(path, **params):
 
 
 def refresh_af(con):
-    """Matchs d'aujourd'hui et demain (limite du plan gratuit) : arbitre + absents par équipe (4 requêtes / 6 h)."""
+    """Hier, aujourd'hui, demain (limite du plan gratuit) : arbitre, absents par équipe et scores finaux.
+    5 requêtes toutes les 6 h sur le quota de 100/jour."""
     if not CFG["AF_KEY"] or time.time() - float(meta_get(con, "af_ts", 0)) < 6 * 3600:
         return
     try:
-        for k in range(2):
+        for k in (-1, 0, 1):
             day = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=k)).strftime("%Y-%m-%d")
             fixtures = af_get("fixtures", date=day)
             time.sleep(7)
             absent = {}
-            for i in af_get("injuries", date=day):
-                w = 1.0 if i["player"].get("type") == "Missing Fixture" else 0.5
-                key = (i["fixture"]["id"], i["team"]["id"])
-                absent[key] = absent.get(key, 0.0) + w
-            time.sleep(7)
+            if k >= 0:
+                for i in af_get("injuries", date=day):
+                    w = 1.0 if i["player"].get("type") == "Missing Fixture" else 0.5
+                    key = (i["fixture"]["id"], i["team"]["id"])
+                    absent[key] = absent.get(key, 0.0) + w
+                time.sleep(7)
             for f in fixtures:
                 fx, t = f["fixture"], f["teams"]
-                con.execute("INSERT OR REPLACE INTO af_fix VALUES(?,?,?,?,?,?,?)", (
-                    fx["id"], fx["timestamp"], t["home"]["name"], t["away"]["name"], fx.get("referee"),
-                    absent.get((fx["id"], t["home"]["id"]), 0.0), absent.get((fx["id"], t["away"]["id"]), 0.0)))
+                ft = f.get("score", {}).get("fulltime") or {}
+                old = con.execute("SELECT home_abs, away_abs FROM af_fix WHERE fixture_id=?", (fx["id"],)).fetchone()
+                ha = absent.get((fx["id"], t["home"]["id"]), old[0] if old else 0.0)
+                aa = absent.get((fx["id"], t["away"]["id"]), old[1] if old else 0.0)
+                con.execute("INSERT OR REPLACE INTO af_fix(fixture_id, ts, home, away, referee, home_abs, away_abs, "
+                            "hg, ag, status) VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                    fx["id"], fx["timestamp"], t["home"]["name"], t["away"]["name"], fx.get("referee"), ha, aa,
+                    ft.get("home"), ft.get("away"), fx["status"]["short"]))
         meta_set(con, "af_ts", time.time())
         con.commit()
     except Exception as e:
         print("api-football:", e)
+
 
 def _sim(a, b):
     import difflib
@@ -269,18 +290,19 @@ def link_af(con, event_id, home, away, commence):
         con.execute("INSERT OR REPLACE INTO ev_af VALUES(?,?,?,?)", (event_id, best[3], best[4], best[2]))
 
 
-def get_af(con, event_id):
+def get_af(con, event_id, before=1e12):
     r = con.execute("SELECT home_abs, away_abs, referee FROM ev_af WHERE event_id=?", (event_id,)).fetchone()
     if not r:
         return AF_DEFAULT
     ref_stats = AF_DEFAULT[2:5]
     if r[2]:
-        # Profil de l'arbitre sur nos matchs terminés (hors ce match), lissé vers la moyenne
+        # Profil de l'arbitre sur nos matchs terminés avant celui-ci, lissé vers la moyenne
         n, hw, dr = con.execute("""
             SELECT COUNT(*), COALESCE(SUM(res.winner = m.home), 0), COALESCE(SUM(res.winner = 'Draw'), 0)
             FROM ev_af a JOIN results res ON res.event_id = a.event_id
-            JOIN (SELECT DISTINCT event_id, home FROM obs) m ON m.event_id = a.event_id
-            WHERE a.referee = ? AND a.event_id != ?""", (r[2], event_id)).fetchone()
+            JOIN (SELECT event_id, home, MIN(commence) AS commence FROM obs GROUP BY event_id) m
+              ON m.event_id = a.event_id
+            WHERE a.referee = ? AND a.event_id != ? AND m.commence < ?""", (r[2], event_id, before)).fetchone()
         k = 10.0
         ref_stats = ((hw + 0.45 * k) / (n + k), (dr + 0.25 * k) / (n + k), float(n))
     return (r[0], r[1], *ref_stats, 1.0)
@@ -310,7 +332,28 @@ def model_prob(*args, **kw):
 
 
 # ---------- apprentissage ----------
+def collect_results_af(con):
+    """Scores finaux (temps réglementaire) via API-Football : aucun quota The Odds API consommé."""
+    now = time.time()
+    rows = con.execute("""SELECT event_id, MAX(home), MAX(away), MIN(commence) FROM obs WHERE commence < ? AND
+        event_id NOT IN (SELECT event_id FROM results) GROUP BY event_id""", (now - 3 * 3600,)).fetchall()
+    for ev_id, home, away, commence in rows:
+        best, score = None, 0.0
+        for r in con.execute("SELECT home, away, hg, ag FROM af_fix WHERE ts BETWEEN ? AND ? AND hg IS NOT NULL "
+                             "AND ag IS NOT NULL AND status IN ('FT','AET','PEN')",
+                             (commence - 3 * 3600, commence + 3 * 3600)):
+            s = min(_sim(home, r[0]), _sim(away, r[1]))
+            if s > score:
+                best, score = r, s
+        if best and score >= 0.6:
+            winner = home if best[2] > best[3] else away if best[3] > best[2] else "Draw"
+            con.execute("INSERT OR REPLACE INTO results VALUES(?,?)", (ev_id, winner))
+    con.commit()
+
+
 def collect_results(con):
+    if CFG["AF_KEY"]:
+        return collect_results_af(con)
     if time.time() - float(meta_get(con, "scores_ts", 0)) < 48 * 3600:
         return
     now = time.time()
@@ -361,7 +404,7 @@ def train(con):
     for r in rows:
         wx, has_wx = get_ctx(con, r[0])
         X.append(features(r[3], r[4], r[2], math.log(r[2] / r[8]), r[5], r[1], r[9], r[10], wx, has_wx, r[11],
-                          sports, get_af(con, r[0])))
+                          sports, get_af(con, r[0], r[6])))
     X = np.array(X)
     y = np.array([1 if r[1] == r[7] else 0 for r in rows])
     cut = int(len(rows) * 0.75)
@@ -436,18 +479,27 @@ def set_bankroll(con, b):
         meta_set(con, "dead_notified", 1)
         tg_send("💀 Ton solde est à 0 : tu es mort. Fin de la partie. Envoie « solde 10 » pour recommencer.")
     elif b > 0:
+        if meta_get(con, "dead_notified") == "1":
+            con.execute("DELETE FROM meta WHERE k='mission_checked'")
         meta_set(con, "dead_notified", 0)
 
 
-def poll_telegram(con):
-    """Lit tes réponses : boutons « placé / ignoré » et commandes texte."""
+def die(con, reason):
+    meta_set(con, "bankroll", 0)
+    meta_set(con, "dead_notified", 1)
+    tg_send(reason + "\nFin de la partie. Envoie « solde 10 » pour recommencer.")
+
+
+def poll_telegram(con, wait=0):
+    """Lit tes réponses : boutons « placé / ignoré » et commandes texte. wait = attente longue (secondes)."""
     if not (CFG["TELEGRAM_TOKEN"] and CFG["TELEGRAM_CHAT"]) or DRY:
         return
     offset = int(meta_get(con, "tg_offset", 0))
     try:
-        updates = tg("getUpdates", offset=offset, timeout=0, allowed_updates=["message", "callback_query"])
+        updates = tg("getUpdates", offset=offset, timeout=wait, allowed_updates=["message", "callback_query"])
     except Exception as e:
         print("telegram:", e)
+        time.sleep(2)
         return
     for u in updates:
         meta_set(con, "tg_offset", u["update_id"] + 1)
@@ -460,9 +512,11 @@ def poll_telegram(con):
             b = con.execute("SELECT id, label, odd, stake, status FROM bets WHERE id=?", (int(bid),)).fetchone()
             if b and b[4] == "proposed":
                 if act == "p":
-                    con.execute("UPDATE bets SET status='placed' WHERE id=?", (b[0],))
-                    set_bankroll(con, bankroll(con)[0] - b[3])
-                    reply = f"✅ Pari enregistré : {b[1]} @ {b[2]} — {b[3]} €. Solde : {bankroll(con)[0]:.2f} €"
+                    stake = round(min(b[3], bankroll(con)[0] * MAX_STAKE_PCT + 1e-9), 2)
+                    con.execute("UPDATE bets SET status='placed', stake=?, placed_ts=? WHERE id=?",
+                                (stake, time.time(), b[0]))
+                    set_bankroll(con, bankroll(con)[0] - stake)
+                    reply = f"✅ Pari enregistré : {b[1]} @ {b[2]} — {stake} €. Solde : {bankroll(con)[0]:.2f} €"
                 else:
                     con.execute("UPDATE bets SET status='ignored' WHERE id=?", (b[0],))
                     reply = "❌ Pari ignoré."
@@ -496,7 +550,8 @@ def poll_telegram(con):
                 except ValueError:
                     pass
             stake = min(stake, bankroll(con)[0] * MAX_STAKE_PCT + 1e-9)
-            con.execute("UPDATE bets SET status='placed', odd=?, stake=? WHERE id=?", (odd, round(stake, 2), b[0]))
+            con.execute("UPDATE bets SET status='placed', odd=?, stake=?, placed_ts=? WHERE id=?",
+                        (odd, round(stake, 2), msg.get("date", time.time()), b[0]))
             set_bankroll(con, bankroll(con)[0] - round(stake, 2))
             tg_send(f"✅ Enregistré : {b[1]} @ {odd} — {round(stake, 2)} € (plafonné à 6 %). Solde : {bankroll(con)[0]:.2f} €")
         elif text in ("/start", "aide", "help"):
@@ -524,26 +579,211 @@ def settle_bets(con):
     con.commit()
 
 
+# ---------- mission quotidienne (12 h - 14 h) ----------
+def win_bounds(day):
+    s = dt.datetime.combine(day, dt.time(int(CFG["MISSION_FROM"])), TZ).timestamp()
+    e = dt.datetime.combine(day, dt.time(int(CFG["MISSION_TO"])), TZ).timestamp()
+    return s, e
+
+
+def mission_done(con, day):
+    s, e = win_bounds(day)
+    g = float(CFG["MISSION_GRACE_MIN"]) * 60
+    return con.execute("SELECT 1 FROM bets WHERE status IN ('placed','won','lost') AND placed_ts BETWEEN ? AND ?",
+                       (s, e + g)).fetchone() is not None
+
+
+def mission_check(con, now):
+    """Mort si un jour terminé n'a aucun pari placé entre 12 h et 14 h (+ marge de confirmation)."""
+    if bankroll(con)[1]:
+        return False
+    g = float(CFG["MISSION_GRACE_MIN"]) * 60
+    today = dt.datetime.fromtimestamp(now, TZ).date()
+    last = meta_get(con, "mission_checked")
+    if last is None:
+        last = today if now >= win_bounds(today)[1] + g else today - dt.timedelta(days=1)
+    else:
+        last = dt.date.fromisoformat(last)
+    while True:
+        nxt = last + dt.timedelta(days=1)
+        if now < win_bounds(nxt)[1] + g:
+            break
+        last = nxt
+        if not mission_done(con, nxt):
+            meta_set(con, "mission_checked", last.isoformat())
+            die(con, f"☠️ Aucun pari placé entre {CFG['MISSION_FROM']}h et {CFG['MISSION_TO']}h le "
+                     f"{nxt.strftime('%d/%m')} : tu es mort.")
+            return True
+    meta_set(con, "mission_checked", last.isoformat())
+    return False
+
+
+def candidates(con, now, horizon, min_ahead=1800):
+    """Tous les paris possibles (dernières cotes connues), classés par avantage estimé (réseau si actif)."""
+    rows = con.execute("""SELECT o.event_id, o.sport, o.commence, o.home, o.away, o.outcome, o.odd, o.cons_p, o.pin_p, o.n
+        FROM obs o WHERE o.ts = (SELECT MAX(ts) FROM obs x WHERE x.event_id=o.event_id AND x.outcome=o.outcome)
+        AND o.ts > ? AND o.commence > ? AND o.commence < ?""", (now - 12 * 3600, now + min_ahead, horizon)).fetchall()
+    out = []
+    for ev_id, sport, commence, home, away, outcome, odd, cons, pin, n in rows:
+        if not 1.25 <= odd <= 8:
+            continue
+        first = con.execute("SELECT odd FROM obs WHERE event_id=? AND outcome=? ORDER BY ts LIMIT 1",
+                            (ev_id, outcome)).fetchone()
+        drift = math.log(odd / first[0]) if first else 0.0
+        wx, has_wx = get_ctx(con, ev_id)
+        p = cons
+        mp = model_prob(p, pin, odd, drift, n, outcome, home, away, wx, has_wx, sport, af=get_af(con, ev_id))
+        if mp is not None:
+            p = (p + mp) / 2
+        out.append({"event_id": ev_id, "commence": commence, "home": home, "away": away, "outcome": outcome,
+                    "odd": odd, "p": p, "edge": p * odd - 1, "drift": drift})
+    return sorted(out, key=lambda c: -c["edge"])
+
+
+def propose_bet(con, now, c, forced=False):
+    bank, dead = bankroll(con)
+    if dead:
+        return None
+    if forced and c["edge"] <= 0:
+        stake = bank * float(CFG["FORCED_STAKE_PCT"])
+    else:
+        stake = bank * max(c["edge"], 0) / (c["odd"] - 1) * float(CFG["KELLY_FRACTION"])
+    stake = round(min(stake, bank * MAX_STAKE_PCT), 2)
+    if stake < MIN_STAKE:
+        if not forced:
+            return None
+        stake = max(round(min(MIN_STAKE, bank * MAX_STAKE_PCT), 2), 0.01)
+    when = dt.datetime.fromtimestamp(c["commence"], TZ).strftime("%d/%m %H:%M")
+    label = c["outcome"] if c["outcome"] != "Draw" else "Match nul"
+    bid = con.execute("INSERT INTO bets(event_id,outcome,label,match,odd,stake,commence,status,ts) "
+                      "VALUES(?,?,?,?,?,?,?,'proposed',?)",
+                      (c["event_id"], c["outcome"], label, f"{c['home']} - {c['away']}", c["odd"], stake,
+                       c["commence"], now)).lastrowid
+    title = ("⏰ Pari obligatoire du jour" if forced else "Pari value") + f" : {label} @ {c['odd']}"
+    extra = ""
+    if forced:
+        extra = (f"\n⚠️ Mission 12h-14h : pas de value bet disponible, c'est le moins mauvais pari "
+                 f"({'avantage estimé ' + format(c['edge'], '+.1%') if c['edge'] > 0 else 'sans avantage, mise réduite'}).\n")
+    notify(title,
+           f"{c['home']} - {c['away']} ({when})\n"
+           f"Pari : {label} à la cote {c['odd']} (Unibet)\n"
+           f"Mise conseillée : {stake} € (solde {bank:.2f} €, max 6 % = {bank*0.06:.2f} €)\n"
+           f"Proba estimée {c['p']:.1%} | edge {c['edge']:+.1%} | dérive de cote {c['drift']:+.1%}\n{extra}\n"
+           f"Pour jouer : ouvre l'appli Unibet > Sport > cherche « {c['home']} » > "
+           f"résultat du match > « {label} » > mise {stake} € > valider.\n"
+           f"Ensuite confirme ci-dessous (ou réponds « ok 0.5 @2.1 » avec ta mise/cote réelles).",
+           [("✅ Pari placé", f"p:{bid}"), ("❌ Ignoré", f"i:{bid}")])
+    con.execute("INSERT OR IGNORE INTO alerts VALUES(?,?,?)", (c["event_id"], c["outcome"], now))
+    return bid
+
+
+def mission_step(con, now, horizon):
+    """Dans la fenêtre 12h-14h : relance un pari en attente, sinon impose le meilleur pari disponible."""
+    day = dt.datetime.fromtimestamp(now, TZ).date()
+    s, e = win_bounds(day)
+    if not (s <= now < e) or mission_done(con, day) or bankroll(con)[1]:
+        return False
+    mins = int((e + float(CFG["MISSION_GRACE_MIN"]) * 60 - now) / 60)
+    pend = con.execute("SELECT id, label, match, odd, stake FROM bets WHERE status='proposed' AND commence > ? "
+                       "ORDER BY id DESC LIMIT 1", (now + 900,)).fetchone()
+    if pend:
+        if now - float(meta_get(con, "mission_ping", 0)) > 1500:
+            meta_set(con, "mission_ping", now)
+            notify(f"⏰ Mission du jour : encore {mins} min",
+                   f"Place ce pari avant {CFG['MISSION_TO']}h sinon tu meurs :\n{pend[2]} — {pend[1]} @ {pend[3]} "
+                   f"({pend[4]} €)", [("✅ Pari placé", f"p:{pend[0]}"), ("❌ Ignoré", f"i:{pend[0]}")])
+        return True
+    pool = [c for c in candidates(con, now, horizon, 3600)
+            if not con.execute("SELECT 1 FROM alerts WHERE event_id=? AND outcome=?",
+                               (c["event_id"], c["outcome"])).fetchone()]
+    if not pool:
+        if now - float(meta_get(con, "mission_ping", 0)) > 1500:
+            meta_set(con, "mission_ping", now)
+            tg_send(f"🚨 Mission du jour : aucun match exploitable dans les {CFG['HORIZON_HOURS']} h. "
+                    f"Il reste {mins} min : parie manuellement et envoie « ok 0.5 @2.1 » pour valider.")
+        return False
+    pick = next((c for c in pool if c["odd"] <= 4), pool[0])
+    propose_bet(con, now, pick, forced=True)
+    meta_set(con, "mission_ping", now)
+    return True
+
+
+def listen(con, day, seconds):
+    until = time.time() + seconds
+    while time.time() < until and not mission_done(con, day):
+        poll_telegram(con, wait=25)
+
+
+def radar(con, now, horizon):
+    """Une fois par jour (dès 9 h) : les meilleurs matchs à venir selon le modèle, à l'avance."""
+    local = dt.datetime.fromtimestamp(now, TZ)
+    if local.hour < 9 or meta_get(con, "radar") == local.date().isoformat():
+        return
+    meta_set(con, "radar", local.date().isoformat())
+    top = [c for c in candidates(con, now, horizon) if c["edge"] > 0][:3]
+    if not top:
+        tg_send("🔭 Radar : aucun match avec avantage pour l'instant. Je continue de surveiller.")
+        return
+    lines = [f"• {c['home']} - {c['away']} ({dt.datetime.fromtimestamp(c['commence'], TZ):%d/%m %H:%M}) : "
+             f"{c['outcome'] if c['outcome'] != 'Draw' else 'Nul'} @ {c['odd']} (edge {c['edge']:+.1%})" for c in top]
+    tg_send("🔭 Radar : meilleurs matchs à surveiller\n" + "\n".join(lines) + "\n\nJe t'alerte quand l'edge dépasse le seuil.")
+
+
 # ---------- cycle ----------
+def plan_fetches(con, now, horizon, urgent):
+    """Championnats à interroger : /events est gratuit, on ne paie /odds que s'il y a des matchs proches."""
+    plans = []
+    for sport in sports_list():
+        try:
+            evs = api(f"/sports/{sport}/events")
+        except Exception as e:
+            print(sport, "events:", e)
+            continue
+        soon = sorted(t for t in (dt.datetime.fromisoformat(x["commence_time"].replace("Z", "+00:00")).timestamp()
+                                  for x in evs) if now < t < horizon)
+        if not soon:
+            continue
+        gap = (1 if urgent else 2) * 3600 if soon[0] - now < 12 * 3600 else 6 * 3600
+        if now - float(meta_get(con, "fetch:" + sport, 0)) >= gap:
+            plans.append((soon[0], sport))
+    return [s for _, s in sorted(plans)]
+
+
 def cycle(con):
+    global SPENT
     now = time.time()
     poll_telegram(con)
     settle_bets(con)
-    if bankroll(con)[1]:
+    if mission_check(con, now) or bankroll(con)[1]:
         print("💀 Bankroll à 0 : plus d'alertes.")
         return
+    con.execute("UPDATE bets SET status='expired' WHERE status='proposed' AND commence < ?", (now,))
     horizon = now + float(CFG["HORIZON_HOURS"]) * 3600
     refresh_af(con)
     min_edge, max_edge = float(CFG["MIN_EDGE"]), float(CFG["MAX_EDGE"])
-    for sport in sports_list():
-        if REMAINING is not None and REMAINING < int(CFG["RESERVE_REQUESTS"]):
-            print(f"Quota presque épuisé ({REMAINING}), pause.")
-            return
+    day = dt.datetime.fromtimestamp(now, TZ).date()
+    s_win, e_win = win_bounds(day)
+    urgent = s_win - 1800 <= now < e_win and not mission_done(con, day)
+    plans = plan_fetches(con, now, horizon, urgent)
+    if meta_get(con, f"budget:{day}") is None:
+        left = max((((day.replace(day=28) + dt.timedelta(days=4)).replace(day=1)) - day).days, 1)
+        meta_set(con, f"budget:{day}", max(0.0, ((REMAINING or 0) - int(CFG["RESERVE_REQUESTS"])) / left))
+    spent = float(meta_get(con, f"spent:{day}", 0))
+    allow = float(meta_get(con, f"budget:{day}")) + (4 if urgent else 0) - spent
+    for sport in plans:
+        if allow < 1 or (REMAINING is not None and REMAINING < int(CFG["RESERVE_REQUESTS"])):
+            print(f"Budget de requêtes du jour atteint (reste {REMAINING}), pause.")
+            break
+        before = SPENT
         try:
             events = api(f"/sports/{sport}/odds", regions="eu", markets="h2h", oddsFormat="decimal")
         except Exception as e:
             print(sport, "erreur:", e)
             continue
+        allow -= SPENT - before
+        spent += SPENT - before
+        meta_set(con, f"spent:{day}", spent)
+        meta_set(con, "fetch:" + sport, now)
         for ev in events:
             commence = dt.datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00")).timestamp()
             if not (now < commence < horizon):
@@ -575,31 +815,19 @@ def cycle(con):
                 bank, dead = bankroll(con)
                 if dead:
                     return
-                kelly = edge / (a["odd"] - 1) * float(CFG["KELLY_FRACTION"])
-                stake = round(min(bank * kelly, bank * MAX_STAKE_PCT), 2)
-                if stake < MIN_STAKE:
-                    continue
-                when = dt.datetime.fromtimestamp(commence, ZoneInfo("Europe/Paris")).strftime("%d/%m %H:%M")
-                label = a["outcome"] if a["outcome"] != "Draw" else "Match nul"
-                bid = con.execute("INSERT INTO bets(event_id,outcome,label,match,odd,stake,commence,status,ts) "
-                                  "VALUES(?,?,?,?,?,?,?,'proposed',?)",
-                                  (ev["id"], a["outcome"], label, f"{ev['home_team']} - {ev['away_team']}",
-                                   a["odd"], stake, commence, now)).lastrowid
-                notify(f"Pari value : {label} @ {a['odd']}",
-                       f"{ev['home_team']} - {ev['away_team']} ({when})\n"
-                       f"Pari : {label} à la cote {a['odd']} (Unibet)\n"
-                       f"Mise conseillée : {stake} € (solde {bank:.2f} €, max 6 % = {bank*0.06:.2f} €)\n"
-                       f"Proba estimée {p:.1%} | edge {edge:+.1%} | dérive de cote {drift:+.1%}\n\n"
-                       f"Pour jouer : ouvre l'appli Unibet > Sport > cherche « {ev['home_team']} » > "
-                       f"résultat du match > « {label} » > mise {stake} € > valider.\n"
-                       f"Ensuite confirme ci-dessous (ou réponds « ok 0.5 @2.1 » avec ta mise/cote réelles).",
-                       [("✅ Pari placé", f"p:{bid}"), ("❌ Ignoré", f"i:{bid}")])
-                con.execute("INSERT INTO alerts VALUES(?,?,?)", (ev["id"], a["outcome"], now))
+                propose_bet(con, now, {"event_id": ev["id"], "commence": commence, "home": ev["home_team"],
+                                       "away": ev["away_team"], "outcome": a["outcome"], "odd": a["odd"], "p": p,
+                                       "edge": edge, "drift": drift})
         con.commit()
     collect_results(con)
     settle_bets(con)
     train(con)
+    radar(con, now, horizon)
+    pending = mission_step(con, now, horizon)
     con.commit()
+    if pending and not DRY:
+        listen(con, day, float(CFG["LISTEN_SECONDS"]))
+        con.commit()
 
 
 def main():
