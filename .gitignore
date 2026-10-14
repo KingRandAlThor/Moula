@@ -1,0 +1,5 @@
+config.env
+state.json
+odds.db
+model.pkl
+__pycache__/
