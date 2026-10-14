@@ -228,25 +228,26 @@ def refresh_af(con):
     """Matchs d'aujourd'hui et demain (limite du plan gratuit) : arbitre + absents par équipe (4 requêtes / 6 h)."""
     if not CFG["AF_KEY"] or time.time() - float(meta_get(con, "af_ts", 0)) < 6 * 3600:
         return
-    meta_set(con, "af_ts", time.time())
     try:
         for k in range(2):
             day = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=k)).strftime("%Y-%m-%d")
             fixtures = af_get("fixtures", date=day)
+            time.sleep(7)
             absent = {}
             for i in af_get("injuries", date=day):
                 w = 1.0 if i["player"].get("type") == "Missing Fixture" else 0.5
                 key = (i["fixture"]["id"], i["team"]["id"])
                 absent[key] = absent.get(key, 0.0) + w
+            time.sleep(7)
             for f in fixtures:
                 fx, t = f["fixture"], f["teams"]
                 con.execute("INSERT OR REPLACE INTO af_fix VALUES(?,?,?,?,?,?,?)", (
                     fx["id"], fx["timestamp"], t["home"]["name"], t["away"]["name"], fx.get("referee"),
                     absent.get((fx["id"], t["home"]["id"]), 0.0), absent.get((fx["id"], t["away"]["id"]), 0.0)))
+        meta_set(con, "af_ts", time.time())
         con.commit()
     except Exception as e:
         print("api-football:", e)
-
 
 def _sim(a, b):
     import difflib
