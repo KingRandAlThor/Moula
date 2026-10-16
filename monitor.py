@@ -920,6 +920,22 @@ def main():
         sys.exit("Renseigne ODDS_API_KEY dans config.env (voir config.example.env).")
     con = db()
     once = "once" in sys.argv
+    if "daemon" in sys.argv:
+        deadline = time.time() + float(os.environ.get("DAEMON_MINUTES", "345")) * 60
+        every = float(os.environ.get("CYCLE_MIN", "30")) * 60
+        nxt = 0.0
+        while time.time() < deadline:
+            if time.time() >= nxt:
+                try:
+                    cycle(con)
+                    print(dt.datetime.now().strftime("%H:%M"), "cycle OK, requêtes restantes:", REMAINING, flush=True)
+                except Exception as e:
+                    print("cycle:", e, flush=True)
+                nxt = time.time() + every
+            poll_telegram(con, wait=25)
+            con.commit()
+        con.commit()
+        return
     while True:
         h = dt.datetime.now(ZoneInfo("Europe/Paris")).hour
         in_hours = int(CFG["ACTIVE_FROM"]) <= h < int(CFG["ACTIVE_TO"])
