@@ -5,3 +5,4 @@ model.pkl
 __pycache__/
 
 hist/
+out/
