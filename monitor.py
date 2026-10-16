@@ -44,7 +44,7 @@ def load_cfg():
         "SMTP_HOST": "smtp.gmail.com", "SMTP_USER": "", "SMTP_PASSWORD": "", "MAIL_TO": "",
         "FREE_USER": "", "FREE_PASS": "", "NTFY_TOPIC": "",
         "TELEGRAM_TOKEN": "", "TELEGRAM_CHAT": "", "AF_KEY": "",
-        "MISSION_FROM": "12", "MISSION_TO": "14", "MISSION_GRACE_MIN": "10", "LISTEN_SECONDS": "300",
+        "MISSION_FROM": "12", "MISSION_TO": "14", "MISSION_GRACE_MIN": "10", "LISTEN_SECONDS": "600",
         "FORCED_STAKE_PCT": "0.02",
     }
     f = BASE / "config.env"
@@ -590,21 +590,23 @@ def poll_telegram(con, wait=0):
                     reply = "❌ Pari ignoré."
             else:
                 reply = "Ce pari est déjà traité."
-            try:
-                tg("answerCallbackQuery", callback_query_id=cb["id"])
-            except Exception:
-                pass
+            for method, kw in (("answerCallbackQuery", {"callback_query_id": cb["id"], "text": reply[:190]}),
+                               ("editMessageReplyMarkup", {"chat_id": cb["message"]["chat"]["id"],
+                                                           "message_id": cb["message"]["message_id"],
+                                                           "reply_markup": {"inline_keyboard": []}})):
+                try:
+                    tg(method, **kw)
+                except Exception as e:
+                    print(method, e)
             tg_send(reply)
             continue
         text = (msg or {}).get("text", "").strip().lower()
         if re.match(r"^(j'ai |jai )?(plac[eé]|pari[eé]|fait|c'est fait|done)\b", text):
             text = "ok " + " ".join(text.split()[1:] if text.split()[0] in ("placé", "place", "fait", "done") else
                                     text.split()[2:] if text.startswith(("j'ai", "jai")) else [])
-        if text.startswith("solde") and len(text.split()) > 1:
-            try:
-                set_bankroll(con, float(text.split()[1].replace(",", ".")))
-            except (IndexError, ValueError):
-                pass
+        m_sol = re.match(r"^sol\w*\s+(\d+(?:[.,]\d+)?)", text)
+        if m_sol:
+            set_bankroll(con, float(m_sol.group(1).replace(",", ".")))
             tg_send(f"Solde : {bankroll(con)[0]:.2f} €")
         elif text.startswith("ok"):
             b = con.execute("SELECT id, label, odd, stake FROM bets WHERE status='proposed' ORDER BY id DESC LIMIT 1").fetchone()
@@ -823,6 +825,10 @@ def plan_fetches(con, now, horizon, urgent):
 def cycle(con):
     global SPENT
     now = time.time()
+    if os.environ.get("REVIVE") == "1" and bankroll(con)[1]:
+        set_bankroll(con, float(CFG.get("BANKROLL") or 10))
+        tg_send(f"🔄 Je suis ressuscité avec {bankroll(con)[0]:.2f} €. Mission 12h-14h : je te propose un pari, "
+                "clique ✅ dès que tu l'as joué sur Unibet.")
     poll_telegram(con)
     settle_bets(con)
     if mission_check(con, now) or bankroll(con)[1]:
@@ -896,7 +902,9 @@ def cycle(con):
     radar(con, now, horizon)
     pending = mission_step(con, now, horizon)
     con.commit()
-    if pending and not DRY:
+    waiting = con.execute("SELECT 1 FROM bets WHERE status='proposed' AND ts > ? AND commence > ?",
+                          (now - 3600, time.time() + 900)).fetchone()
+    if (pending or waiting) and not DRY:
         listen(con, day, float(CFG["LISTEN_SECONDS"]))
         con.commit()
 

@@ -3,3 +3,5 @@ state.json
 odds.db
 model.pkl
 __pycache__/
+
+hist/

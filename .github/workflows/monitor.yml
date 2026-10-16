@@ -16,13 +16,16 @@ on:
     - cron: "30 20 * * *"
     - cron: "30 22 * * *"
   workflow_dispatch:
-
+    inputs:
+      revive:
+        description: "Ressusciter le bot (solde remis à BANKROLL)"
+        default: "0"
 concurrency: monitor
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -56,4 +59,5 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
           AF_KEY: ${{ secrets.AF_KEY }}
+          REVIVE: ${{ github.event.inputs.revive }}
         run: python monitor.py once
