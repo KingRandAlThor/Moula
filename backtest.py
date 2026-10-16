@@ -21,6 +21,7 @@ def load():
         except Exception:
             continue
         d["season"] = f.split("\\")[-1].split("/")[-1].split("_")[0]
+        d["Div"] = f.split("\\")[-1].split("/")[-1].split("_")[1].split(".")[0]
         frames.append(d)
     df = pd.concat(frames, ignore_index=True)
     df = df[df["FTR"].isin(["H", "D", "A"])].copy()

@@ -42,7 +42,7 @@ def features():
                 "gfA": fa[1], "gaA": fa[2], "restH": min(fh[3], 30), "restA": min(fa[3], 30),
                 "nH": len(hist[h]), "nA": len(hist[a]),
                 "refHome": (rr[1] + 4) / (rr[0] + 10), "refDraw": (rr[2] + 2.5) / (rr[0] + 10),
-                "div": r.Div,
+                "div": r.Div, "oH": getattr(r, "B365H", None), "oD": getattr(r, "B365D", None), "oA": getattr(r, "B365A", None),
             })
         # mise à jour après le match
         hg, ag = r.FTHG, r.FTAG
